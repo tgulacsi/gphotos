@@ -1,22 +1,8 @@
-// Copyright 2016 Tamás Gulácsi
-//
-//
-//    Licensed under the Apache License, Version 2.0 (the "License");
-//    you may not use this file except in compliance with the License.
-//    You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-//    Unless required by applicable law or agreed to in writing, software
-//    distributed under the License is distributed on an "AS IS" BASIS,
-//    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//    See the License for the specific language governing permissions and
-//    limitations under the License.
-
 package gphotos
 
 import (
 	"net/http"
+	"time"
 
 	"google.golang.org/api/drive/v3"
 )
@@ -30,7 +16,7 @@ import (
 // If sinceToken is not empty, only the changed photos are returned.
 //
 // Returns a new token to watch future changes.
-func Photos(client *http.Client, sinceToken string) (<-chan MaybeFiles, string, error) {
+func Photos(client *http.Client, sinceToken string) (<-chan MaybePhotos, string, error) {
 	srv, err := drive.New(client)
 	if err != nil {
 		return nil, "", err
@@ -57,24 +43,24 @@ func Photos(client *http.Client, sinceToken string) (<-chan MaybeFiles, string, 
 		if err != nil {
 			return nil, "", err
 		}
-		ch := make(chan MaybeFiles)
+		ch := make(chan MaybePhotos)
 		go func() {
 			defer close(ch)
 			for {
-				files := make([]*drive.File, 0, len(r.Changes))
+				photos := make([]Photo, 0, len(r.Changes))
 				for _, c := range r.Changes {
 					if c.File != nil {
-						files = append(files, c.File)
+						photos = append(photos, fileAsPhoto(c.File))
 					}
 				}
-				if len(files) > 0 {
-					ch <- MaybeFiles{Files: files}
+				if len(photos) > 0 {
+					ch <- MaybePhotos{Photos: photos}
 				}
 				if r.NextPageToken == "" {
 					return
 				}
 				if r, err = L(r.NextPageToken).Do(); err != nil {
-					ch <- MaybeFiles{Err: err}
+					ch <- MaybePhotos{Err: err}
 					return
 				}
 			}
@@ -91,17 +77,21 @@ func Photos(client *http.Client, sinceToken string) (<-chan MaybeFiles, string, 
 	if err != nil {
 		return nil, nextToken, err
 	}
-	ch := make(chan MaybeFiles)
+	ch := make(chan MaybePhotos)
 	go func() {
 		defer close(ch)
 		for {
-			ch <- MaybeFiles{Files: r.Files}
+			photos := make([]Photo, 0, len(r.Files))
+			for _, f := range r.Files {
+				photos = append(photos, fileAsPhoto(f))
+			}
+			ch <- MaybePhotos{Photos: photos}
 
 			if r.NextPageToken == "" {
 				return
 			}
 			if r, err = listCall.PageToken(r.NextPageToken).Do(); err != nil {
-				ch <- MaybeFiles{Err: err}
+				ch <- MaybePhotos{Err: err}
 				return
 			}
 		}
@@ -111,7 +101,46 @@ func Photos(client *http.Client, sinceToken string) (<-chan MaybeFiles, string, 
 }
 
 // MaybeFiles may contain files slice, or an error.
-type MaybeFiles struct {
-	Files []*drive.File
-	Err   error
+type MaybePhotos struct {
+	Photos []Photo
+	Err    error
+}
+
+type Photo struct {
+	ID                          string
+	Name, MimeType, Description string
+	Starred                     bool
+	Parents                     []string
+	Properties                  map[string]string
+	WebContentLink              string
+	CreatedTime, ModifiedTime   time.Time
+	OriginalFilename            string
+	drive.FileImageMediaMetadata
+}
+
+func fileAsPhoto(f *drive.File) Photo {
+	if f == nil {
+		return Photo{}
+	}
+	p := Photo{
+		ID:               f.Id,
+		Name:             f.Name,
+		MimeType:         f.MimeType,
+		Description:      f.Description,
+		Starred:          f.Starred,
+		Parents:          f.Parents,
+		Properties:       f.Properties,
+		WebContentLink:   f.WebContentLink,
+		OriginalFilename: f.OriginalFilename,
+	}
+	if f.ImageMediaMetadata != nil {
+		p.FileImageMediaMetadata = *f.ImageMediaMetadata
+	}
+	if f.CreatedTime != "" {
+		p.CreatedTime, _ = time.Parse(time.RFC3339, f.CreatedTime)
+	}
+	if f.ModifiedTime != "" {
+		p.ModifiedTime, _ = time.Parse(time.RFC3339, f.ModifiedTime)
+	}
+	return p
 }

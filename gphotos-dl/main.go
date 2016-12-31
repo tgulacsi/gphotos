@@ -172,9 +172,9 @@ func main() {
 		if mf.Err != nil {
 			log.Fatal(mf.Err)
 		}
-		if len(mf.Files) == 0 {
+		if len(mf.Photos) == 0 {
 			continue
 		}
-		log.Printf("%d files, first: %#v", len(mf.Files), mf.Files[0])
+		log.Printf("%d photos, first: %#v", len(mf.Photos), mf.Photos[0])
 	}
 }
