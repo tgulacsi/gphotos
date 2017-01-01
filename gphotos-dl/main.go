@@ -163,7 +163,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	ch, next, err := gphotos.Photos(client, "")
+	ch, next, err := gphotos.Photos(ctx, client, "")
 	if err != nil {
 		log.Fatal(err)
 	}
