@@ -2,8 +2,6 @@ package gphotos
 
 import (
 	"context"
-	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -15,7 +13,7 @@ import (
 
 // The maximum rate limit is 10 qps per IP address.
 // The default value set in Google API Console is 1 qps per IP address.
-var Rate = rate.NewLimiter(5, 1)
+var Rate = rate.NewLimiter(10, 1)
 
 // Photos returns a channel which will receive all the photos metadata
 // in batches.
@@ -32,29 +30,27 @@ func Photos(ctx context.Context, client *http.Client, sinceToken string) (<-chan
 		return nil, "", err
 	}
 
-	log.Println("Rate for GeteStartPageToken")
-	if err := Rate.Wait(ctx); err != nil {
-		return nil, "", err
-	}
-	sr, err := srv.Changes.GetStartPageToken().Do()
+	sr, err := do(ctx, func() (interface{}, error) { return srv.Changes.GetStartPageToken().Do() })
 	if err != nil {
 		return nil, "", err
 	}
-	nextToken := sr.StartPageToken
+	nextToken := sr.(*drive.StartPageToken).StartPageToken
 
 	const fields = "nextPageToken, files(id,name,mimeType,description,starred,parents,properties,webContentLink,createdTime,modifiedTime,owners,originalFilename,imageMediaMetadata)"
 
 	if sinceToken != "" {
 		L := func(token string) (*drive.ChangeList, error) {
-			log.Println("Rate for Changes.List")
-			if err := Rate.Wait(ctx); err != nil {
-				return nil, err
+			I, err := do(ctx, func() (interface{}, error) {
+				return srv.Changes.List(token).
+					Fields(fields).
+					Spaces("photos").
+					PageSize(1000).
+					IncludeRemoved(false).Do()
+			})
+			if I != nil {
+				return I.(*drive.ChangeList), err
 			}
-			return srv.Changes.List(token).
-				Fields(fields).
-				Spaces("photos").
-				PageSize(1000).
-				IncludeRemoved(false).Do()
+			return nil, err
 		}
 
 		r, err := L(sinceToken)
@@ -62,34 +58,7 @@ func Photos(ctx context.Context, client *http.Client, sinceToken string) (<-chan
 			return nil, "", err
 		}
 		ch := make(chan MaybePhotos)
-		go func() {
-			defer close(ch)
-			for {
-				go func() {
-					photos := make([]Photo, 0, len(r.Changes))
-					for _, c := range r.Changes {
-						if c.File != nil {
-							p, err := fileAsPhoto(ctx, srv.Files, c.File)
-							photos = append(photos, p)
-							if err != nil {
-								ch <- MaybePhotos{Photos: photos, Err: err}
-								return
-							}
-						}
-					}
-					if len(photos) > 0 {
-						ch <- MaybePhotos{Photos: photos}
-					}
-				}()
-				if r.NextPageToken == "" {
-					return
-				}
-				if r, err = L(r.NextPageToken); err != nil {
-					ch <- MaybePhotos{Err: err}
-					return
-				}
-			}
-		}()
+		go getChanges(ctx, ch, L, srv.Files, r)
 		return ch, nextToken, err
 	}
 
@@ -98,48 +67,83 @@ func Photos(ctx context.Context, client *http.Client, sinceToken string) (<-chan
 		Spaces("photos").
 		PageSize(1000)
 	L := func(token string) (*drive.FileList, error) {
-		log.Println("Rate for Files.List")
-		if err := Rate.Wait(ctx); err != nil {
-			return nil, err
-		}
 		listCall := listCall
 		if token != "" {
 			listCall = listCall.PageToken(token)
 		}
-		return listCall.Do()
+		I, err := do(ctx, func() (interface{}, error) {
+			return listCall.Do()
+		})
+		if I != nil {
+			return I.(*drive.FileList), err
+		}
+		return nil, err
 	}
 	r, err := L("")
 	if err != nil {
 		return nil, nextToken, err
 	}
 	ch := make(chan MaybePhotos)
-	go func() {
-		defer close(ch)
-		for {
-			go func() {
-				photos := make([]Photo, 0, len(r.Files))
-				for _, f := range r.Files {
-					p, err := fileAsPhoto(ctx, srv.Files, f)
+	go getPhotos(ctx, ch, L, srv.Files, r)
+
+	return ch, nextToken, nil
+}
+
+func getPhotos(ctx context.Context, ch chan<- MaybePhotos, L func(string) (*drive.FileList, error), srv *drive.FilesService, r *drive.FileList) {
+	defer close(ch)
+	for {
+		go func() {
+			photos := make([]Photo, 0, len(r.Files))
+			for _, f := range r.Files {
+				p, err := fileAsPhoto(ctx, srv, f)
+				photos = append(photos, p)
+				if err != nil {
+					ch <- MaybePhotos{Photos: photos, Err: err}
+					return
+				}
+			}
+			ch <- MaybePhotos{Photos: photos}
+		}()
+
+		if r.NextPageToken == "" {
+			return
+		}
+		var err error
+		if r, err = L(r.NextPageToken); err != nil {
+			ch <- MaybePhotos{Err: err}
+			return
+		}
+	}
+}
+
+func getChanges(ctx context.Context, ch chan<- MaybePhotos, L func(string) (*drive.ChangeList, error), srv *drive.FilesService, r *drive.ChangeList) {
+	defer close(ch)
+	for {
+		go func() {
+			photos := make([]Photo, 0, len(r.Changes))
+			for _, c := range r.Changes {
+				if c.File != nil {
+					p, err := fileAsPhoto(ctx, srv, c.File)
 					photos = append(photos, p)
 					if err != nil {
 						ch <- MaybePhotos{Photos: photos, Err: err}
 						return
 					}
 				}
+			}
+			if len(photos) > 0 {
 				ch <- MaybePhotos{Photos: photos}
-			}()
-
-			if r.NextPageToken == "" {
-				return
 			}
-			if r, err = L(r.NextPageToken); err != nil {
-				ch <- MaybePhotos{Err: err}
-				return
-			}
+		}()
+		if r.NextPageToken == "" {
+			return
 		}
-	}()
-
-	return ch, nextToken, nil
+		var err error
+		if r, err = L(r.NextPageToken); err != nil {
+			ch <- MaybePhotos{Err: err}
+			return
+		}
+	}
 }
 
 // MaybeFiles may contain files slice, or an error.
@@ -221,16 +225,15 @@ func fileOf(ctx context.Context, srv *drive.FilesService, p string) (*drive.File
 			if f := dirs[p]; f != nil {
 				return f, nil
 			}
-			log.Println("Rate for Get", p)
-			if err := Rate.Wait(ctx); err != nil {
-				return nil, err
+			I, err := do(ctx, func() (interface{}, error) {
+				return srv.Get(p).Fields("id, name, parents").Do()
+			})
+			if I != nil {
+				f := I.(*drive.File)
+				dirs[p] = f
+				return f, nil
 			}
-			f, err := srv.Get(p).Fields("id, name, parents").Do()
-			if err != nil {
-				return nil, fmt.Errorf("get %q: %v", p, err)
-			}
-			dirs[p] = f
-			return f, nil
+			return nil, err
 		})
 	if err != nil {
 		return nil, err
@@ -249,4 +252,21 @@ func pathOf(ctx context.Context, srv *drive.FilesService, f *drive.File) ([]stri
 	}
 	prev, err := pathOf(ctx, srv, p)
 	return append(prev, nm...), err
+}
+
+func do(ctx context.Context, f func() (interface{}, error)) (interface{}, error) {
+	for {
+		if err := Rate.Wait(ctx); err != nil {
+			return nil, err
+		}
+		resp, err := f()
+		if err != nil {
+			if strings.Contains(err.Error(), "Rate Limit Exceeded") {
+				Rate.SetLimit(Rate.Limit() * 0.9)
+				continue
+			}
+			return nil, err
+		}
+		return resp, err
+	}
 }
